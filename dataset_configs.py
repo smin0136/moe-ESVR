@@ -76,5 +76,92 @@ DATASET_CONFIGS = {
         "chunk_len": 0.4,
         "use_tif": False,
         "transpose": False,
-    }
+    },
+    # Multivariate volumes stored as point lists: a coordinate file (N, 3) and
+    # one value file (N, V) per timestep. Loaded by load_multivar_volume().
+    "rocom_masked": {
+        "training_mode": "full",
+        "format": "npy_points",
+        "data_dir": "/home/Paris/yjkim/mtvESVR/data/ROCOM_256x166x132_masked",
+        "coord_file": "coordinate.npy",
+        "data_pattern": "data_{t:04d}.npy",
+        "mask_file": "valid_mask.npy",
+        "variables": ["cboron", "mutl", "p", "rhol", "vl_0", "vl_1", "vl_2", "yplus"],
+        "x_voxel_size": 256,
+        "y_voxel_size": 166,
+        "z_voxel_size": 132,
+        # t=0 has constant cboron/yplus inside the mask, so t=2 is the default.
+        "timestep": 2,
+        # Already normalized to [0, 1] over all timesteps (outside=0, inside>=0.02).
+        "normalize": "none",
+        "use_tif": False,
+        "transpose": False,
+    },
+    "snu_down_down": {
+        "training_mode": "full",
+        "format": "npy_points",
+        "data_dir": "/home/Paris/hsson/dataset/snu_data",
+        "coord_file": "down_down_coordinate.npy",
+        "data_pattern": "down_down_data_{t:04d}.npy",
+        "mask_file": None,
+        "variables": ["L2", "P", "U", "V", "W", "Wx", "Wy", "Wz"],
+        "x_voxel_size": 512,
+        "y_voxel_size": 64,
+        "z_voxel_size": 32,
+        "timestep": 0,
+        "normalize": "minmax",
+        "use_tif": False,
+        "transpose": False,
+    },
+    # Multivariate volumes stored as one raw little-endian float32 file per
+    # variable, z-major (x fastest). raw_size is (X, Y, Z) on disk; the volume is
+    # mean-pooled by `downsample`, and *_voxel_size give the pooled size.
+    "ionization_ds2": {
+        "training_mode": "full",
+        "format": "raw_vars",
+        "data_dir": "/home/Paris/hsson/dataset/ionization",
+        "file_patterns": {
+            "H_2": "H_2/H_2{t:04d}.dat",
+            "H+": "H+/H+{t:04d}.dat",
+            "He": "He/He{t:04d}.dat",
+            "PD": "PD/PD{t:04d}.dat",
+        },
+        "variables": ["H_2", "H+", "He", "PD"],
+        "raw_size": (600, 248, 248),
+        "downsample": 2,
+        "x_voxel_size": 300,
+        "y_voxel_size": 124,
+        "z_voxel_size": 124,
+        # He is only extracted for t <= 90.
+        "timestep": 50,
+        "normalize": "minmax",
+        "mask_file": None,
+        "use_tif": False,
+        "transpose": False,
+    },
+    "combustion_ds2": {
+        "training_mode": "full",
+        "format": "raw_vars",
+        "data_dir": "/home/Paris/hsson/dataset/combustion",
+        "file_patterns": {
+            "hr": "jet_hr/jet_hr_{t:04d}.dat",
+            "mixfrac": "jet_mixfrac/jet_mixfrac_{t:04d}.dat",
+            "vort": "jet_vort/jet_vort_{t:04d}.dat",
+            "Y_OH": "jet_Y_OH/jet_Y_OH_{t:04d}.dat",
+        },
+        "variables": ["hr", "mixfrac", "vort", "Y_OH"],
+        "raw_size": (480, 720, 120),
+        "downsample": 2,
+        # Training assumes x is the longest axis, so disk y becomes x.
+        "axes": (1, 0, 2),
+        "x_voxel_size": 360,
+        "y_voxel_size": 240,
+        "z_voxel_size": 60,
+        # Files are numbered from 1.
+        "timestep": 60,
+        "normalize": "minmax",
+        "mask_file": None,
+        "use_tif": False,
+        "transpose": False,
+    },
 }

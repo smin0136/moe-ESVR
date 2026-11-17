@@ -39,7 +39,7 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, x_resol: int, y_resol: int, z_resol: int):
+    def __init__(self, x_resol: int, y_resol: int, z_resol: int, num_channels: int = 1):
         self._xyz = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -53,6 +53,8 @@ class GaussianModel:
         self.x_resol = x_resol 
         self.y_resol = y_resol 
         self.z_resol = z_resol 
+        # Number of intensity channels; one channel per variable that shares this geometry.
+        self.num_channels = num_channels
         self.setup_functions()
         self.mu_factor = 400*math.sqrt(2 * 3.14159265358979323846)
 
@@ -99,6 +101,14 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    def get_intensity(self, channel_idx):
+        return self.opacity_activation(self._opacity[:, channel_idx:channel_idx + 1])
+
+    @property
+    def get_aggregate_intensity(self):
+        # A primitive is kept if any variable needs it, so prune on the max channel.
+        return self.get_opacity.max(dim=1, keepdim=True).values
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -157,7 +167,11 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z']
-        l.append('opacity')
+        if self.num_channels == 1:
+            l.append('opacity')
+        else:
+            for i in range(self.num_channels):
+                l.append('intensity_{}'.format(i))
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -203,7 +217,13 @@ class GaussianModel:
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        intensity_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("intensity_")]
+        if intensity_names:
+            intensity_names = sorted(intensity_names, key = lambda x: int(x.split('_')[-1]))
+            opacities = np.stack([np.asarray(plydata.elements[0][name]) for name in intensity_names], axis=1)
+        else:
+            opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        self.num_channels = opacities.shape[1]
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -378,7 +398,7 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
         # print('After densification, # of points:', self.get_xyz.shape[0])
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_aggregate_intensity < min_opacity).squeeze(-1)
 
         xyz = self.get_xyz
 
@@ -418,6 +438,11 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:3], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
+    def add_densification_stats_norm(self, grad_norm, update_filter):
+        # Same as add_densification_stats, with the gradient norm computed by the caller.
+        self.xyz_gradient_accum[update_filter] += grad_norm[update_filter]
+        self.denom[update_filter] += 1
+
     def prune_gaussians(self, percent, import_score: list):
         sorted_tensor, _ = torch.sort(import_score, dim=0)
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
@@ -425,13 +450,13 @@ class GaussianModel:
         prune_mask = (import_score <= value_nth_percentile).squeeze()
         self.prune_points(prune_mask)
 
-    def prune_out_bbox(self, chunk_size=None):
+    def prune_out_bbox(self, chunk_size=None, margin=0.1, verbose=True):
         xyz = self.get_xyz
 
         if chunk_size is None:
             chunk_size = 2.0 # default
         half = chunk_size / 2.0
-        half = half + chunk_size * 0.1  # add some overlap
+        half = half + chunk_size * margin  # add some overlap
 
         # chunk / full 학습 일반화
         prune_mask_bbox = ( 
@@ -445,7 +470,8 @@ class GaussianModel:
 
         self.prune_points(prune_mask_bbox)
         torch.cuda.empty_cache()
-        print('Number of primitives after pruning out bbox:',self.get_xyz.shape[0])
+        if verbose:
+            print('Number of primitives after pruning out bbox:',self.get_xyz.shape[0])
 
     def prune_gaussians_zeros(self, gaussian_counts: list):
         # print('before prune zeros:', self.get_xyz.shape[0])
@@ -455,8 +481,8 @@ class GaussianModel:
 
     def prune_dark_gaussians(self):
         # print('before prune dark:', self.get_xyz.shape[0])
-        opacity = self.get_opacity
-        prune_mask_bbox = (opacity < 1/255).squeeze()
+        opacity = self.get_aggregate_intensity
+        prune_mask_bbox = (opacity < 1/255).squeeze(-1)
         
 
         self.prune_points(prune_mask_bbox)
@@ -473,13 +499,13 @@ class GaussianModel:
         torch.cuda.empty_cache()
         print('get_xyz.shape[0]',self.get_xyz.shape[0])
 
-    def create_random_onthefly(self, num_start : int, spatial_lr_scale : float, chunk_len : float):
+    def create_random_onthefly(self, num_start : int, spatial_lr_scale : float, chunk_len : float, seed : int = 42, knn_on_scaled : bool = False):
             self.spatial_lr_scale = spatial_lr_scale
             print(spatial_lr_scale)
             num_pts = num_start
             print(f"Generating random point cloud ({num_pts})...")
 
-            rng = np.random.default_rng(seed=42)
+            rng = np.random.default_rng(seed=seed)
 
             xyz = rng.random((num_pts, 3)) * 2.0 - 1.0
             if chunk_len != 2.0: # for chunked training, scale to chunk size
@@ -499,12 +525,15 @@ class GaussianModel:
             print("Number of points at initialisation : ", fused_point_cloud.shape[0])
             print("Initialized xyz range: ", fused_point_cloud.min(dim=0)[0], fused_point_cloud.max(dim=0)[0])
 
-            dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(xyz).float().cuda()), 0.0000001)
+            # knn_on_scaled measures spacing after the aspect-ratio scaling, which
+            # matters for thin volumes; the default keeps the original cube spacing.
+            knn_points = fused_point_cloud if knn_on_scaled else torch.from_numpy(xyz).float().cuda()
+            dist2 = torch.clamp_min(distCUDA2(knn_points), 0.0000001)
             scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
             rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
             rots[:, 0] = 1
 
-            opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+            opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], self.num_channels), dtype=torch.float, device="cuda"))
 
             self._xyz = nn.Parameter((fused_point_cloud).requires_grad_(True))
             self._scaling = nn.Parameter(scales.requires_grad_(True))

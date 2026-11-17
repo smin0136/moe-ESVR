@@ -16,6 +16,8 @@
 #include <cuda_rasterizer/config.h>
 #include <imgui_internal.h>
 #include "tfeditorGUI.h"
+#include "picojson/picojson.hpp"
+#include <algorithm>
 
 
 // Define the types and sizes that make up the contents of each Gaussian 
@@ -82,8 +84,71 @@ SIBR_ERR << cudaGetErrorString(cudaGetLastError());
 # define CUDA_SAFE_CALL(A) A
 #endif
 
-// Load the Gaussians from the given file.
-int loadPly(const char* filename,
+// Append the Gaussians of one PLY to points. The header is parsed, so files
+// with several intensity channels (MoE experts: intensity_0..V-1) work too;
+// x/y/z, scale_0..2 and rot_0..3 must be consecutive float properties.
+void readPlyPoints(const sibr::GaussianPlySource& source, std::vector<RichPoint>& points)
+{
+	std::ifstream infile(source.file, std::ios_base::binary);
+
+	if (!infile.good())
+		SIBR_ERR << "Unable to find model's PLY file, attempted:\n" << source.file << std::endl;
+
+	std::string buff;
+	int count = 0;
+	std::vector<std::string> props;
+	while (std::getline(infile, buff))
+	{
+		if (!buff.empty() && buff.back() == '\r')
+			buff.pop_back();
+		std::stringstream ss(buff);
+		std::string word, type, name;
+		ss >> word;
+		if (word == "element")
+			ss >> name >> count;
+		else if (word == "property")
+		{
+			ss >> type >> name;
+			if (type != "float")
+				SIBR_ERR << "Only float PLY properties are supported, got " << type << " " << name << std::endl;
+			props.push_back(name);
+		}
+		else if (word == "end_header")
+			break;
+	}
+
+	auto index = [&props](const std::string& name) {
+		auto it = std::find(props.begin(), props.end(), name);
+		return it == props.end() ? -1 : int(it - props.begin());
+	};
+	const std::string intensityName = source.channel < 0 ? "opacity" : "intensity_" + std::to_string(source.channel);
+	int io = index(intensityName);
+	if (io < 0 && source.channel == 0)
+		io = index("opacity");	// single-channel expert
+	const int ix = index("x"), is = index("scale_0"), ir = index("rot_0");
+	if (ix < 0 || io < 0 || is < 0 || ir < 0)
+		SIBR_ERR << source.file << " lacks x, " << intensityName << ", scale_0 or rot_0" << std::endl;
+
+	SIBR_LOG << "Loading " << count << " Gaussian splats from " << source.file << " (" << intensityName << ")" << std::endl;
+
+	std::vector<float> row(props.size());
+	const size_t start = points.size();
+	points.resize(start + count);
+	for (int i = 0; i < count; ++i)
+	{
+		infile.read(reinterpret_cast<char*>(row.data()), sizeof(float) * row.size());
+		RichPoint& p = points[start + i];
+		p.pos = Pos(row[ix], row[ix + 1], row[ix + 2]);
+		p.opacity = row[io];
+		for (int j = 0; j < 3; ++j)
+			p.scale.scale[j] = row[is + j];
+		for (int j = 0; j < 4; ++j)
+			p.rot.rot[j] = row[ir + j];
+	}
+}
+
+// Load the Gaussians from the given files as one set.
+int loadPly(const std::vector<sibr::GaussianPlySource>& sources,
 	std::vector<Pos>& pos,
 	std::vector<float>& opacities,
 	std::vector<Scale>& scales,
@@ -91,48 +156,14 @@ int loadPly(const char* filename,
 	sibr::Vector3f& minn,
 	sibr::Vector3f& maxx)
 {
-	std::ifstream infile(filename, std::ios_base::binary);
-
-	if (!infile.good())
-		SIBR_ERR << "Unable to find model's PLY file, attempted:\n" << filename << std::endl;
-
-	// "Parse" header (it has to be a specific format anyway)
-	std::string buff;
-	std::getline(infile, buff);
-	std::getline(infile, buff);
-
-	std::string dummy;
-	std::getline(infile, buff);
-	std::stringstream ss(buff);
-	int count;
-	ss >> dummy >> dummy >> count;
-
-	// Output number of Gaussians contained
-	SIBR_LOG << "Loading " << count << " Gaussian splats" << std::endl;
-
-	while (std::getline(infile, buff))
-		if (buff.compare("end_header") == 0)
-			break;
-
 	// Read all Gaussians at once (AoS)
-	std::vector<RichPoint> points(count);
-	//infile.read((char*)points.data(), count * sizeof(RichPoint));
+	std::vector<RichPoint> points;
+	for (const auto& source : sources)
+		readPlyPoints(source, points);
+	const int count = int(points.size());
+	if (count == 0)
+		SIBR_ERR << "No Gaussians to load" << std::endl;
 
-    for (size_t i = 0; i < count; ++i) {
-        // Read position
-        infile.read(reinterpret_cast<char*>(&points[i].pos), sizeof(Pos));
-
-        // Read opacity
-        infile.read(reinterpret_cast<char*>(&points[i].opacity), sizeof(float));
-
-        // Read scale
-        infile.read(reinterpret_cast<char*>(&points[i].scale), sizeof(Scale));
-
-        // Read rotation
-        infile.read(reinterpret_cast<char*>(&points[i].rot), sizeof(Rot));
-
-    }
-	
 	// Resize our SoA data
 	pos.resize(count);
 	scales.resize(count);
@@ -367,8 +398,101 @@ std::function<char* (size_t N)> resizeFunctional(void** ptr, size_t& S) {
 	return lambda;
 }
 
+bool sibr::GaussianView::loadMoERouting(const std::string& modelDir, const std::string& initialVariable)
+{
+	std::ifstream infile(modelDir + "/routing.json");
+	if (!infile.good())
+		return false;
+
+	picojson::value root;
+	const std::string err = picojson::parse(root, infile);
+	if (!err.empty())
+		SIBR_ERR << "Could not parse " << modelDir << "/routing.json: " << err << std::endl;
+	const picojson::object& info = root.get<picojson::object>();
+	const picojson::object& routing = info.at("routing").get<picojson::object>();
+
+	std::vector<std::string> names;
+	if (info.count("variables"))
+		for (const auto& name : info.at("variables").get<picojson::array>())
+			names.push_back(name.get<std::string>());
+	else
+		for (const auto& entry : routing)
+			names.push_back(entry.first);
+
+	for (const auto& name : names)
+	{
+		// Separate models store one [expert, channel] pair, routed models a list of pairs.
+		const picojson::array& entry = routing.at(name).get<picojson::array>();
+		std::vector<picojson::array> pairs;
+		if (!entry.empty() && entry[0].is<double>())
+			pairs.push_back(entry);
+		else
+			for (const auto& pair : entry)
+				pairs.push_back(pair.get<picojson::array>());
+
+		std::vector<GaussianPlySource> sources;
+		std::string experts;
+		for (const auto& pair : pairs)
+		{
+			const int expert = int(pair[0].get<double>());
+			sources.push_back({ modelDir + "/expert_" + std::to_string(expert) + "/point_cloud.ply", int(pair[1].get<double>()) });
+			experts += (experts.empty() ? "E" : " E") + std::to_string(expert);
+		}
+		_variableNames.push_back(name);
+		_variableExperts.push_back(experts);
+		_variableSources.push_back(sources);
+	}
+
+	_currentVariable = 0;
+	for (int v = 0; v < int(names.size()); ++v)
+		if (names[v] == initialVariable || std::to_string(v) == initialVariable)
+			_currentVariable = v;
+	SIBR_LOG << "MoE model with " << names.size() << " variables, showing " << names[_currentVariable] << std::endl;
+	return true;
+}
+
+void sibr::GaussianView::uploadGaussians(const std::vector<GaussianPlySource>& sources)
+{
+	// Load the PLY data (AoS) to the GPU (SoA)
+	std::vector<Pos> pos;
+	std::vector<Rot> rot;
+	std::vector<Scale> scale;
+	std::vector<float> opacity;
+	count = loadPly(sources, pos, opacity, scale, rot, _scenemin, _scenemax);
+
+	_boxmin = _scenemin;
+	_boxmax = _scenemax;
+
+	int P = count;
+
+	// Free the previous set (cudaFree ignores nullptr)
+	cudaFree(pos_cuda);
+	cudaFree(rot_cuda);
+	cudaFree(opacity_cuda);
+	cudaFree(scale_cuda);
+	cudaFree(rect_cuda);
+
+	// Allocate GPU memory
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&pos_cuda, sizeof(Pos) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos_cuda, pos.data(), sizeof(Pos) * P, cudaMemcpyHostToDevice));
+
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rot_cuda, sizeof(Rot) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot_cuda, rot.data(), sizeof(Rot) * P, cudaMemcpyHostToDevice));
+
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&opacity_cuda, sizeof(float) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity_cuda, opacity.data(), sizeof(float) * P, cudaMemcpyHostToDevice));
+
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&scale_cuda, sizeof(Scale) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale_cuda, scale.data(), sizeof(Scale) * P, cudaMemcpyHostToDevice));
+
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rect_cuda, 2 * P * sizeof(int)));
+
+	SIBR_LOG << "Allocated " << ((sizeof(Pos) + sizeof(Rot) + sizeof(float) + sizeof(Scale)) * P / (1024*1024)) << " MB for " << P << " Gaussians" << std::endl;
+}
+
 sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint render_w, uint render_h, const std::string& ply_file,
-	const std::shared_ptr<InteractiveCameraHandler>& cameraHandler, bool* messageRead, bool useInterop, int device) :
+	const std::shared_ptr<InteractiveCameraHandler>& cameraHandler, bool* messageRead, bool useInterop, int device,
+	const std::string& variable) :
 	_scene(ibrScene),
 	_cameraHandler(cameraHandler),
 	_dontshow(messageRead),
@@ -408,41 +532,19 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 	init_transferFunction();
 	//findLowPoints();
 	
-	// Load the PLY data (AoS) to the GPU (SoA)
-	std::vector<Pos> pos;
-	std::vector<Rot> rot;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
-	std::vector<Scale> scale;
-	std::vector<float> opacity;
-	
-	const char* file = ply_file.c_str();
-	count = loadPly(file, pos, opacity, scale, rot, _scenemin, _scenemax);
+	// A directory with routing.json is an MoE model (one PLY per expert); load
+	// the experts the current variable is routed to. Otherwise ply_file is one PLY.
+	if (loadMoERouting(ply_file, variable))
+		uploadGaussians(_variableSources[_currentVariable]);
+	else
+		uploadGaussians({ { ply_file, -1 } });
 
-	_boxmin = _scenemin;
-	_boxmax = _scenemax;
-
-	int P = count;
-	
-	// Allocate GPU memory
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&pos_cuda, sizeof(Pos) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(pos_cuda, pos.data(), sizeof(Pos) * P, cudaMemcpyHostToDevice));
-	
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rot_cuda, sizeof(Rot) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(rot_cuda, rot.data(), sizeof(Rot) * P, cudaMemcpyHostToDevice));
-	
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&opacity_cuda, sizeof(float) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity_cuda, opacity.data(), sizeof(float) * P, cudaMemcpyHostToDevice));
-	
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&scale_cuda, sizeof(Scale) * P));
-	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale_cuda, scale.data(), sizeof(Scale) * P, cudaMemcpyHostToDevice));
-	
-	SIBR_LOG << "Allocated " << ((sizeof(Pos) + sizeof(Rot) + sizeof(float) + sizeof(Scale)) * P / (1024*1024)) << " MB for " << P << " Gaussians" << std::endl;
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&transferFunction_cuda, sizeof(transferFunction)));
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(transferFunction_cuda, transferFunction, sizeof(transferFunction), cudaMemcpyHostToDevice));
 
 	// Create space for view parameters
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&view_cuda, sizeof(sibr::Matrix4f)));
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&proj_cuda, sizeof(sibr::Matrix4f)));
-	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&rect_cuda, 2 * count * sizeof(int)));
 
 	partial_rgb_global = nullptr;
 	partial_T_global = nullptr;
@@ -797,6 +899,19 @@ void sibr::GaussianView::onGUI()
 
 		if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::TextUnformatted("Render Mode: Ellipsoids");
+			if (!_variableNames.empty()) {
+				int selected = _currentVariable;
+				bool (*getName)(void*, int, const char**) = [](void* data, int idx, const char** out) {
+					*out = (*static_cast<std::vector<std::string>*>(data))[idx].c_str();
+					return true;
+				};
+				ImGui::Combo("Variable", &selected, getName, &_variableNames, int(_variableNames.size()));
+				if (selected != _currentVariable) {
+					_currentVariable = selected;
+					uploadGaussians(_variableSources[selected]);
+				}
+				ImGui::Text("Experts: %s  (%d Gaussians)", _variableExperts[_currentVariable].c_str(), count);
+			}
 			ImGui::SliderFloat("Scaling Modifier", &_scalingModifier, 0.001f, 1.0f);
 			if (_cameraHandler) {
 				ImGui::Checkbox("Show trackball", &_cameraHandler->getTrackball().drawThis);

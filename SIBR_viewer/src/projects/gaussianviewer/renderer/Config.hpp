@@ -48,6 +48,7 @@ namespace sibr {
 		Arg<int> device = {"device", 0, "CUDA device index"};
 		Arg<bool> noInterop = { "no_interop", "Don't try to use interop (may be required for unconventional OpenGL setups, like WSL)" };
 		Arg<bool> whiteBackground = { "white-background", "Use a white rendering background" };
+		Arg<std::string> variable = { "variable", "", "MoE model: variable to show first (name or index)" };
 	};
 
 }

@@ -1,0 +1,21 @@
+{
+  "groups": [
+    [
+      "cboron"
+    ],
+    [
+      "mutl"
+    ],
+    [
+      "p",
+      "rhol",
+      "vl_0",
+      "vl_1",
+      "vl_2"
+    ],
+    [
+      "yplus"
+    ]
+  ],
+  "metric": "transfer"
+}

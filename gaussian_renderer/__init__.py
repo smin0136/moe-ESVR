@@ -27,7 +27,8 @@ def query(
     pipe,
     scaling_modifier=1.0,
     use_step_function=False,
-    ghost_pc : Optional[GaussianModel] = None 
+    ghost_pc : Optional[GaussianModel] = None,
+    channel_idx : Optional[int] = None,
 ):
     """
     Query a volume with voxelization.
@@ -49,13 +50,17 @@ def query(
     )
     voxelizer = GaussianVoxelizer(voxel_settings=voxel_settings)
 
+    # channel_idx selects one variable's intensity from a multi-channel model.
+    def intensity_of(model):
+        return model.get_opacity if channel_idx is None else model.get_intensity(channel_idx)
+
     means3D = pc.get_xyz
-    density = pc.get_opacity
+    density = intensity_of(pc)
 
     if ghost_pc is not None: 
         # print('ghost pc num:', ghost_pc.get_xyz.shape[0])
         means3D = torch.cat([ghost_pc.get_xyz.detach(), means3D], dim=0)
-        density = torch.cat([ghost_pc.get_opacity.detach(), density], dim=0)
+        density = torch.cat([intensity_of(ghost_pc).detach(), density], dim=0)
 
     scales = None
     rotations = None
@@ -98,6 +103,120 @@ def query(
         "radii": radii_trainable,
     }
 
+def query_experts(
+    experts,
+    channels,
+    center,
+    nVoxel,
+    sVoxel,
+    pipe,
+    scaling_modifier=1.0,
+    use_step_function=False,
+):
+    """
+    Voxelize several experts as one primitive set and return their summed volume.
+    experts[j] contributes its intensity channel channels[j].
+    """
+    voxel_settings = GaussianVoxelizationSettings(
+        scale_modifier=scaling_modifier,
+        nVoxel_x=int(nVoxel[0]),
+        nVoxel_y=int(nVoxel[1]),
+        nVoxel_z=int(nVoxel[2]),
+        sVoxel_x=float(sVoxel[0]),
+        sVoxel_y=float(sVoxel[1]),
+        sVoxel_z=float(sVoxel[2]),
+        center_x=float(center[0]),
+        center_y=float(center[1]),
+        center_z=float(center[2]),
+        prefiltered=False,
+        debug=pipe.debug,
+        use_step_function=use_step_function
+    )
+    voxelizer = GaussianVoxelizer(voxel_settings=voxel_settings)
+
+    means3D = torch.cat([e.get_xyz for e in experts], dim=0)
+    density = torch.cat([e.get_intensity(c) for e, c in zip(experts, channels)], dim=0)
+
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = torch.cat([e.get_covariance(scaling_modifier) for e in experts], dim=0)
+    else:
+        scales = torch.cat([e.get_scaling for e in experts], dim=0)
+        rotations = torch.cat([e.get_rotation for e in experts], dim=0)
+
+    vol_pred, radii = voxelizer(
+        means3D=means3D,
+        opacities=density,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp,
+    )
+
+    radii_max = torch.max(torch.stack((radii[0], radii[1], radii[2])), dim=0)[0]
+    radii_per_expert = torch.split(radii_max, [e.get_xyz.shape[0] for e in experts])
+
+    return {
+        "vol": vol_pred,
+        "visibility_filter": [r > 0 for r in radii_per_expert],
+        "radii": list(radii_per_expert),
+    }
+
+def query_attr_moe(
+    pc,
+    variable,
+    center,
+    nVoxel,
+    sVoxel,
+    pipe,
+    tau=1.0,
+    hard=False,
+    scaling_modifier=1.0,
+    use_step_function=False,
+):
+    """
+    Voxelize one variable of an AttrMoEGaussianModel.
+    Soft: every primitive contributes all G expert slots weighted by its routing
+    softmax (N*G primitives when slots differ in shape). Hard: each primitive
+    contributes only its argmax slot for this variable.
+    """
+    voxel_settings = GaussianVoxelizationSettings(
+        scale_modifier=scaling_modifier,
+        nVoxel_x=int(nVoxel[0]),
+        nVoxel_y=int(nVoxel[1]),
+        nVoxel_z=int(nVoxel[2]),
+        sVoxel_x=float(sVoxel[0]),
+        sVoxel_y=float(sVoxel[1]),
+        sVoxel_z=float(sVoxel[2]),
+        center_x=float(center[0]),
+        center_y=float(center[1]),
+        center_z=float(center[2]),
+        prefiltered=False,
+        debug=pipe.debug,
+        use_step_function=use_step_function
+    )
+    voxelizer = GaussianVoxelizer(voxel_settings=voxel_settings)
+
+    means3D, scales, rotations, density, slots = pc.render_inputs(variable, tau, hard)
+
+    vol_pred, radii = voxelizer(
+        means3D=means3D,
+        opacities=density,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+    )
+
+    radii_max = torch.max(torch.stack((radii[0], radii[1], radii[2])), dim=0)[0]
+    if slots > 1:
+        radii_max = radii_max.reshape(-1, slots).max(dim=1).values
+    return {
+        "vol": vol_pred,
+        "visibility_filter": radii_max > 0,
+        "radii": radii_max,
+    }
+
 def count_query(
     pc: GaussianModel,
     center,
@@ -127,7 +246,7 @@ def count_query(
     voxelizer = GaussianVoxelizer_Count(voxel_settings=voxel_settings)
 
     means3D = pc.get_xyz
-    density = pc.get_opacity
+    density = pc.get_aggregate_intensity
 
     scales = None
     rotations = None

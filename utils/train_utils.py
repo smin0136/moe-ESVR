@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import uuid
@@ -169,6 +170,97 @@ def load_volume_chunk(config, bounds):
     return result
 
 
+def _coordinate_grid_index(coords, dims):
+    """Map each (N, 3) coordinate row to integer (x, y, z) grid indices."""
+    columns = []
+    counts = []
+    for col in range(3):
+        _, inverse = np.unique(coords[:, col], return_inverse=True)
+        columns.append(inverse.astype(np.int64))
+        counts.append(int(inverse.max()) + 1)
+
+    # Coordinate columns may be stored in any axis order; match them by size.
+    used = set()
+    index = []
+    for dim in dims:
+        matches = [col for col, count in enumerate(counts) if count == dim and col not in used]
+        if not matches:
+            raise ValueError(f"Cannot map coordinate columns with sizes {counts} to dims {dims}")
+        used.add(matches[0])
+        index.append(columns[matches[0]])
+    return tuple(index)
+
+
+def _load_raw_variable(path, raw_size, factor):
+    """Read one z-major raw float32 volume as (X, Y, Z), mean-pooled by factor."""
+    X, Y, Z = raw_size
+    volume = np.fromfile(path, dtype="<f4").reshape(Z, Y, X).transpose(2, 1, 0)
+    if factor > 1:
+        X, Y, Z = X // factor, Y // factor, Z // factor
+        volume = volume[:X * factor, :Y * factor, :Z * factor]
+        volume = volume.reshape(X, factor, Y, factor, Z, factor).mean(axis=(1, 3, 5), dtype=np.float64)
+    return np.ascontiguousarray(volume, dtype=np.float32)
+
+
+def load_multivar_volume(config, timestep=None):
+    """Load a multivariate volume as a (V, X, Y, Z) CUDA tensor.
+
+    Returns (volume, mask, normalization), where mask is an (X, Y, Z) bool
+    tensor or None, and normalization maps each variable to its (min, max)
+    in the original units.
+    """
+    dims = (config["x_voxel_size"], config["y_voxel_size"], config["z_voxel_size"])
+    timestep = config["timestep"] if timestep is None else timestep
+    if config["format"] == "raw_vars":
+        normalization = {}
+        volume = np.zeros((len(config["variables"]),) + dims, dtype=np.float32)
+        for v, name in enumerate(config["variables"]):
+            path = os.path.join(config["data_dir"], config["file_patterns"][name].format(t=timestep))
+            channel = _load_raw_variable(path, config["raw_size"], config.get("downsample", 1))
+            channel = np.nan_to_num(channel.transpose(config.get("axes", (0, 1, 2))), nan=0.0, posinf=0.0, neginf=0.0)
+            vmin, vmax = float(channel.min()), float(channel.max())
+            if config["normalize"] == "minmax":
+                channel = (channel - vmin) / max(vmax - vmin, 1e-12)
+            normalization[name] = (vmin, vmax)
+            volume[v] = channel
+            print(f"Loading {path}: {name:>8s} raw [{vmin:.6g}, {vmax:.6g}]")
+        return torch.from_numpy(volume).cuda(), None, normalization
+
+    data_dir = config["data_dir"]
+    variables = config["variables"]
+
+    coords = np.load(os.path.join(data_dir, config["coord_file"]), mmap_mode="r")
+    grid_index = _coordinate_grid_index(np.asarray(coords), dims)
+
+    data_path = os.path.join(data_dir, config["data_pattern"].format(t=timestep))
+    values = np.asarray(np.load(data_path, mmap_mode="r"), dtype=np.float32)
+    values = values.reshape(-1, len(variables))
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    print(f"Loading {data_path}: {values.shape}")
+
+    normalization = {}
+    volume = np.zeros((len(variables),) + dims, dtype=np.float32)
+    for v, name in enumerate(variables):
+        channel = values[:, v]
+        vmin, vmax = float(channel.min()), float(channel.max())
+        if config["normalize"] == "minmax":
+            # Each variable is normalized independently so no range dominates the loss.
+            channel = (channel - vmin) / max(vmax - vmin, 1e-12)
+        normalization[name] = (vmin, vmax)
+        volume[v][grid_index] = channel
+        print(f"  {name:>8s}: raw [{vmin:.6g}, {vmax:.6g}]")
+
+    mask = None
+    if config.get("mask_file"):
+        mask_values = np.load(os.path.join(data_dir, config["mask_file"])).reshape(-1) > 0
+        mask_np = np.zeros(dims, dtype=bool)
+        mask_np[grid_index] = mask_values
+        mask = torch.from_numpy(mask_np).cuda()
+        print(f"  valid mask: {mask_np.mean() * 100:.2f}% of voxels")
+
+    return torch.from_numpy(volume).cuda(), mask, normalization
+
+
 def make_subvolume_centers(volume_shape, subvolume_size, thin_axis_size=70):
     """Return deterministic patch centers that cover a chunk including its edges."""
     def axis_centers(size, patch_size):
@@ -203,6 +295,25 @@ def prepare_output_and_logger(args):
     os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), "w") as cfg_log:
         cfg_log.write(str(Namespace(**vars(args))))
+
+
+def write_volume_json(model_path, shape):
+    """Write volume.json so the viewer can clip ray samples to the volume.
+
+    shape is (X, Y, Z) in Gaussian x, y, z order. Training maps voxel centers of
+    every axis onto the x axis grid (step 2/X, centered), so the box is those
+    centers padded by half a voxel.
+    """
+    X = shape[0]
+    step = 2.0 / X
+    bbox_min, bbox_max = [], []
+    for n in shape:
+        first = -1.0 + ((X - n) // 2) * step
+        bbox_min.append(first - step / 2)
+        bbox_max.append(first + (n - 1) * step + step / 2)
+    info = {"volume_shape": [int(n) for n in shape], "bbox_min": bbox_min, "bbox_max": bbox_max}
+    with open(os.path.join(model_path, "volume.json"), "w") as f:
+        json.dump(info, f, indent=2)
 
 
 def write_training_parameters(

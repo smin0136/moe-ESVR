@@ -117,14 +117,16 @@ int main(int ac, char** av)
 	std::string plyfile = myArgs.modelPath.get();
 	if (plyfile.back() != '/')
 		plyfile += "/";
-	plyfile += "point_cloud";
-	if (!myArgs.iteration.isInit())
-	{
-		plyfile += "/" + findLargestNumberedSubdirectory(plyfile) + "/point_cloud.ply";
-	}
+	// MoE models (expert_k/point_cloud.ply + routing.json) are loaded from the model directory itself.
+	if (fs::exists(plyfile + "routing.json"))
+		plyfile.pop_back();
 	else
 	{
-		plyfile += "/iteration_" + myArgs.iteration.get() + "/point_cloud.ply";
+		plyfile += "point_cloud";
+		if (!myArgs.iteration.isInit())
+			plyfile += "/" + findLargestNumberedSubdirectory(plyfile) + "/point_cloud.ply";
+		else
+			plyfile += "/iteration_" + myArgs.iteration.get() + "/point_cloud.ply";
 	}
 	
 	// This viewer is independent from cameras.json. Use one deterministic startup view.
@@ -168,7 +170,7 @@ int main(int ac, char** av)
 	// Create the Gaussian view and let it host the trackball controls in its unified panel.
 	GaussianView::Ptr gaussianView(new GaussianView(
 		scene, sceneResWidth, sceneResHeight, plyfile, generalCamera,
-		&messageRead, !myArgs.noInterop, device));
+		&messageRead, !myArgs.noInterop, device, myArgs.variable.get()));
 
 	// Add views to mvm.
 	MultiViewManager        multiViewManager(window, false);

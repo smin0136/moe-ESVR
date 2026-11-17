@@ -17,3 +17,15 @@ cmake-build-*/
 *.so
 *.dll
 *.pyd
+
+# Training outputs and run logs (job generators and summaries are kept)
+output/
+logs/*
+!logs/make_*_jobs.sh
+!logs/summarize_*.py
+!logs/worker_q3.sh
+!logs/write_volume_json.py
+!logs/export_nonuni_compare.sh
+
+# CUDA extensions built for one server (246)
+ext_site/

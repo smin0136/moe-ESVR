@@ -35,6 +35,14 @@ namespace sibr {
 	class BufferCopyRenderer2;
 	class InteractiveCameraHandler;
 
+	/// One PLY to load and the intensity channel to read from it
+	/// (-1 = "opacity"; c >= 0 = "intensity_c", or "opacity" in single-channel files).
+	struct GaussianPlySource
+	{
+		std::string file;
+		int channel;
+	};
+
 	/**
 	 * \class RemotePointView
 	 * \brief Wrap a ULR renderer with additional parameters and information.
@@ -50,10 +58,12 @@ namespace sibr {
 	 * \param ibrScene The scene to use for rendering.
 	 * \param render_w rendering width
 	 * \param render_h rendering height
+	 * \param ply_file A single PLY, or an MoE model directory (expert_k/point_cloud.ply + routing.json)
+	 * \param variable MoE only: variable shown first (name or index; empty = first)
 	 */
 	GaussianView(const sibr::BasicIBRScene::Ptr& ibrScene, uint render_w, uint render_h, const std::string& ply_file,
 		const std::shared_ptr<InteractiveCameraHandler>& camera_handler, bool* message_read,
-		bool useInterop = true, int device = 0);		/** Replace the current scene.
+		bool useInterop = true, int device = 0, const std::string& variable = "");		/** Replace the current scene.
 		 *\param newScene the new scene to render */
 		void setScene(const sibr::BasicIBRScene::Ptr & newScene);
 
@@ -87,6 +97,18 @@ namespace sibr {
 
 	protected:
 
+		/** Load the given PLY sources as one Gaussian set and upload it to the GPU (replacing the current one). */
+		void uploadGaussians(const std::vector<GaussianPlySource>& sources);
+
+		/** Read routing.json of an MoE model directory. \return false if there is none. */
+		bool loadMoERouting(const std::string& modelDir, const std::string& initialVariable);
+
+		// MoE models: per variable, the expert PLYs and channels it is routed to.
+		std::vector<std::string> _variableNames;
+		std::vector<std::string> _variableExperts;
+		std::vector<std::vector<GaussianPlySource>> _variableSources;
+		int _currentVariable = 0;
+
 		bool _cropping = false;
 		sibr::Vector3f _boxmin, _boxmax, _scenemin, _scenemax;
 		char _buff[512] = "cropped.ply";
@@ -108,16 +130,16 @@ namespace sibr {
 		int fpsSampleEnd = 750;
 		float lastFrameTime = 0.0f;
 
-		int count;
+		int count = 0;
 		float step_size = 1.0f;
-				
-		float* pos_cuda;
-		float* rot_cuda;
-		float* scale_cuda;
-		float* opacity_cuda;
-		
+
+		float* pos_cuda = nullptr;
+		float* rot_cuda = nullptr;
+		float* scale_cuda = nullptr;
+		float* opacity_cuda = nullptr;
+
 		float* transferFunction_cuda;
-		int* rect_cuda;
+		int* rect_cuda = nullptr;
 		float* partial_rgb_global;
 		float* partial_T_global;
 

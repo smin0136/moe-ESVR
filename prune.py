@@ -166,8 +166,8 @@ def _count_query_chunked(
                 torch.cuda.empty_cache()
 
     if gaussian_count_total is None:
-        gaussian_count_total = torch.zeros_like(gaussians.get_opacity)
-        important_score_total = torch.zeros_like(gaussians.get_opacity)
+        gaussian_count_total = torch.zeros_like(gaussians.get_aggregate_intensity)
+        important_score_total = torch.zeros_like(gaussians.get_aggregate_intensity)
 
     return gaussian_count_total, important_score_total, voxel_count_np
 
